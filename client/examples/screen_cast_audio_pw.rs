@@ -408,8 +408,11 @@ fn run_capture(
     mainloop.run();
 
     // Stop the RT callbacks before tearing down the consumer.
-    drop(stream);
+    // Unregister the listener before destroying the stream: `StreamBox::drop`
+    // frees the stream and leaves the listener hook's pointers dangling, and
+    // `StreamListener::drop` removes the hook unconditionally.
     drop(listener);
+    drop(stream);
 
     stats.running.store(false, Ordering::Relaxed);
     consumer_handle.thread().unpark();
