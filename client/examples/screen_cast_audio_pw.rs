@@ -314,6 +314,7 @@ fn run_capture(
         *pw::keys::NODE_LATENCY,
         format!("{QUANTUM_FRAMES}/{SAMPLE_RATE}"),
     );
+    // Targets are source nodes, so stream.capture.sink is intentionally not set.
     if let Some(target) = target.as_deref() {
         // `pw::keys::TARGET_OBJECT` is gated behind the `v0_3_44` feature, which
         // this crate does not enable; use the key value directly (the C reference
@@ -323,9 +324,16 @@ fn run_capture(
 
     let stream = pw::stream::StreamBox::new(&core, "ashpd-audio-capture", props)?;
 
+    let state_loop = Rc::clone(&mainloop);
     let process_stats = Arc::clone(&stats);
     let listener = stream
         .add_local_listener_with_user_data(())
+        .state_changed(move |_, _, old, new| {
+            eprintln!("stream state: {old:?} -> {new:?}");
+            if matches!(new, pw::stream::StreamState::Error(_)) {
+                state_loop.quit();
+            }
+        })
         .param_changed(|_, _, id, param| {
             let Some(param) = param else {
                 return;
@@ -400,8 +408,8 @@ fn run_capture(
     mainloop.run();
 
     // Stop the RT callbacks before tearing down the consumer.
-    drop(listener);
     drop(stream);
+    drop(listener);
 
     stats.running.store(false, Ordering::Relaxed);
     consumer_handle.thread().unpark();
