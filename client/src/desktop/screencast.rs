@@ -8,7 +8,7 @@
 //! ```rust,no_run
 //! use ashpd::desktop::{
 //!     PersistMode,
-//!     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType},
+//!     screencast::{AudioOptions, CursorMode, Screencast, SelectSourcesOptions, SourceType},
 //! };
 //!
 //! async fn run() -> ashpd::Result<()> {
@@ -21,6 +21,7 @@
 //!                 .set_cursor_mode(CursorMode::Metadata)
 //!                 .set_sources(SourceType::Monitor | SourceType::Window)
 //!                 .set_multiple(true)
+//!                 .set_audio(AudioOptions::default())
 //!                 .set_persist_mode(PersistMode::DoNot),
 //!         )
 //!         .await?;
@@ -31,6 +32,7 @@
 //!         .response()?;
 //!     response.streams().iter().for_each(|stream| {
 //!         println!("node id: {}", stream.pipe_wire_node_id());
+//!         println!("media type: {:?}", stream.media_type());
 //!         println!("size: {:?}", stream.size());
 //!         println!("position: {:?}", stream.position());
 //!         println!("pipewire serial: {:?}", stream.pipewire_serial());
@@ -92,10 +94,61 @@ pub enum CursorMode {
     Metadata,
 }
 
+#[derive(Serialize, Deserialize, PartialEq, Eq, Hash, Copy, Clone, Debug, Type)]
+#[zvariant(signature = "s")]
+#[serde(rename_all = "lowercase")]
+/// The type of media carried by a stream.
+pub enum MediaType {
+    /// A video stream.
+    Video,
+    /// An audio stream.
+    Audio,
+}
+
 #[derive(Serialize, Type, Debug, Default)]
 /// Specified options for a [`Screencast::open_pipe_wire_remote`] request.
 #[zvariant(signature = "dict")]
 pub struct OpenPipeWireRemoteOptions {}
+
+#[derive(Serialize, Deserialize, Type, Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[zvariant(signature = "dict")]
+/// The audio to associate with the selected sources.
+///
+/// The absence of this option means audio is not requested. An empty
+/// configuration (the [`Default`]) requests audio with the requesting
+/// application's own audio excluded; [`AudioOptions::set_include_self`] set to
+/// `true` allows the requester's audio to be included when it belongs to a
+/// selected source.
+pub struct AudioOptions {
+    #[serde(default, with = "as_value", skip_serializing_if = "is_false")]
+    include_self: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+impl AudioOptions {
+    /// Creates a configuration requesting audio with the requester's own audio
+    /// excluded.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets whether audio produced by the requesting application may be
+    /// included when it belongs to a selected source.
+    #[must_use]
+    pub fn set_include_self(mut self, include_self: bool) -> Self {
+        self.include_self = include_self;
+        self
+    }
+
+    /// Gets whether the requester's own audio may be included.
+    pub fn include_self(&self) -> bool {
+        self.include_self
+    }
+}
 
 #[derive(Serialize, Deserialize, Type, Debug, Default)]
 /// Specified options for a [`Screencast::select_sources`] request.
@@ -107,6 +160,8 @@ pub struct SelectSourcesOptions {
     types: Option<BitFlags<SourceType>>,
     #[serde(default, with = "optional", skip_serializing_if = "Option::is_none")]
     multiple: Option<bool>,
+    #[serde(default, with = "optional", skip_serializing_if = "Option::is_none")]
+    audio: Option<AudioOptions>,
     #[serde(default, with = "optional", skip_serializing_if = "Option::is_none")]
     cursor_mode: Option<CursorMode>,
     #[serde(
@@ -134,6 +189,17 @@ impl SelectSourcesOptions {
     #[cfg(feature = "backend")]
     pub fn is_multiple(&self) -> Option<bool> {
         self.multiple
+    }
+
+    /// Sets the audio to associate with the selected sources.
+    ///
+    /// Use `None` to not request audio, [`AudioOptions::default`] to request
+    /// audio while excluding the requester's own audio, or
+    /// [`AudioOptions::set_include_self`] to allow the requester's audio.
+    #[must_use]
+    pub fn set_audio(mut self, audio: impl Into<Option<AudioOptions>>) -> Self {
+        self.audio = audio.into();
+        self
     }
 
     /// Sets how the cursor will be drawn on the screen cast stream.
@@ -349,6 +415,13 @@ impl Stream {
     pub fn pipewire_serial(&self) -> Option<u64> {
         self.1.pipewire_serial
     }
+
+    /// The type of media carried by the stream.
+    ///
+    /// Streams without a media type are video streams.
+    pub fn media_type(&self) -> MediaType {
+        self.1.media_type.unwrap_or(MediaType::Video)
+    }
 }
 
 impl Debug for Stream {
@@ -359,6 +432,8 @@ impl Debug for Stream {
             .field("size", &self.size())
             .field("source_type", &self.source_type())
             .field("id", &self.id())
+            .field("media_type", &self.media_type())
+            .field("pipewire_serial", &self.pipewire_serial())
             .finish()
     }
 }
@@ -377,6 +452,13 @@ struct StreamProperties {
     #[serde(default, with = "optional", skip_serializing_if = "Option::is_none")]
     mapping_id: Option<String>,
     #[serde(default, with = "optional", skip_serializing_if = "Option::is_none")]
+    media_type: Option<MediaType>,
+    #[serde(
+        rename = "pipewire-serial",
+        default,
+        with = "optional",
+        skip_serializing_if = "Option::is_none"
+    )]
     pipewire_serial: Option<u64>,
 }
 
@@ -403,6 +485,7 @@ impl StreamBuilder {
                     size: None,
                     source_type: None,
                     mapping_id: None,
+                    media_type: None,
                     pipewire_serial: None,
                 },
             ),
@@ -438,6 +521,13 @@ impl StreamBuilder {
     /// aspects of the resource this stream corresponds to).
     pub fn mapping_id(mut self, mapping_id: impl Into<Option<String>>) -> Self {
         self.stream.1.mapping_id = mapping_id.into();
+        self
+    }
+
+    /// Set the stream's optional media type. Streams without a media type are
+    /// video streams.
+    pub fn media_type(mut self, media_type: impl Into<Option<MediaType>>) -> Self {
+        self.stream.1.media_type = media_type.into();
         self
     }
 
@@ -633,3 +723,84 @@ impl SessionPortal for Screencast {}
 /// Defines which portals session can be used in a screen-cast.
 pub trait IsScreencastSession: SessionPortal {}
 impl IsScreencastSession for Screencast {}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use zbus::zvariant::{Endian, Value, serialized::Context, to_bytes};
+
+    use super::*;
+
+    #[test]
+    fn media_type_serialization() {
+        let ctxt = Context::new_dbus(Endian::Little, 0);
+
+        let encoded = to_bytes(ctxt, &MediaType::Video).unwrap();
+        let decoded: String = encoded.deserialize().unwrap().0;
+        assert_eq!(decoded, "video");
+
+        let encoded = to_bytes(ctxt, &"audio").unwrap();
+        let decoded: MediaType = encoded.deserialize().unwrap().0;
+        assert_eq!(decoded, MediaType::Audio);
+    }
+
+    #[test]
+    fn stream_media_type_deserialization() {
+        let ctxt = Context::new_dbus(Endian::Little, 0);
+
+        let mut properties: HashMap<&str, Value<'_>> = HashMap::new();
+        properties.insert("media_type", Value::from("audio"));
+        let encoded = to_bytes(ctxt, &(42u32, &properties)).unwrap();
+        let stream: Stream = encoded.deserialize().unwrap().0;
+        assert_eq!(stream.pipe_wire_node_id(), 42);
+        assert_eq!(stream.media_type(), MediaType::Audio);
+
+        // Absent media_type means the stream is a video stream.
+        let properties: HashMap<&str, Value<'_>> = HashMap::new();
+        let encoded = to_bytes(ctxt, &(7u32, &properties)).unwrap();
+        let stream: Stream = encoded.deserialize().unwrap().0;
+        assert_eq!(stream.media_type(), MediaType::Video);
+    }
+
+    #[test]
+    fn stream_pipewire_serial_deserialization() {
+        let ctxt = Context::new_dbus(Endian::Little, 0);
+
+        let mut properties: HashMap<&str, Value<'_>> = HashMap::new();
+        properties.insert("pipewire-serial", Value::from(9_876_543_210u64));
+        let encoded = to_bytes(ctxt, &(42u32, &properties)).unwrap();
+        let stream: Stream = encoded.deserialize().unwrap().0;
+        assert_eq!(stream.pipewire_serial(), Some(9_876_543_210));
+
+        let properties: HashMap<&str, Value<'_>> = HashMap::new();
+        let encoded = to_bytes(ctxt, &(7u32, &properties)).unwrap();
+        let stream: Stream = encoded.deserialize().unwrap().0;
+        assert_eq!(stream.pipewire_serial(), None);
+    }
+
+    #[test]
+    fn select_sources_options_audio_serialization() {
+        let ctxt = Context::new_dbus(Endian::Little, 0);
+
+        // Absent: no audio requested.
+        let options = SelectSourcesOptions::default();
+        let encoded = to_bytes(ctxt, &options).unwrap();
+        let decoded: SelectSourcesOptions = encoded.deserialize().unwrap().0;
+        assert!(decoded.audio.is_none());
+
+        // Empty dictionary: audio requested, requester excluded.
+        let options = SelectSourcesOptions::default().set_audio(AudioOptions::default());
+        let encoded = to_bytes(ctxt, &options).unwrap();
+        let decoded: SelectSourcesOptions = encoded.deserialize().unwrap().0;
+        let audio = decoded.audio.expect("audio requested");
+        assert!(!audio.include_self());
+
+        // include_self=true.
+        let options = SelectSourcesOptions::default()
+            .set_audio(AudioOptions::default().set_include_self(true));
+        let encoded = to_bytes(ctxt, &options).unwrap();
+        let decoded: SelectSourcesOptions = encoded.deserialize().unwrap().0;
+        assert!(decoded.audio.expect("audio requested").include_self());
+    }
+}

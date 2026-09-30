@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     os::fd::{AsFd, OwnedFd},
     sync::Arc,
 };
@@ -8,7 +9,10 @@ use ashpd::{
     WindowIdentifier,
     desktop::{
         PersistMode, Session,
-        screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType, Stream},
+        screencast::{
+            AudioOptions, CursorMode, MediaType, Screencast, SelectSourcesOptions, SourceType,
+            Stream,
+        },
     },
     enumflags2::BitFlags,
 };
@@ -17,7 +21,10 @@ use gtk::glib::{self, clone};
 
 use crate::{
     portals::spawn_tokio,
-    widgets::{CameraPaintable, PortalPage, PortalPageExt, PortalPageImpl},
+    widgets::{
+        CameraPaintable, NoiseGenerator, PortalPage, PortalPageExt, PortalPageImpl,
+        ScreenCastRecorder,
+    },
 };
 
 mod imp {
@@ -27,11 +34,21 @@ mod imp {
     #[template(resource = "/com/belmoussaoui/ashpd/demo/screencast.ui")]
     pub struct ScreenCastPage {
         #[template_child]
-        pub streams_carousel: TemplateChild<adw::Carousel>,
+        pub streams_box: TemplateChild<gtk::Box>,
         #[template_child]
         pub response_group: TemplateChild<adw::PreferencesGroup>,
         #[template_child]
         pub multiple_switch: TemplateChild<adw::SwitchRow>,
+        #[template_child]
+        pub audio_switch: TemplateChild<adw::SwitchRow>,
+        #[template_child]
+        pub include_self_switch: TemplateChild<adw::SwitchRow>,
+        #[template_child]
+        pub record_switch: TemplateChild<adw::SwitchRow>,
+        #[template_child]
+        pub record_path_entry: TemplateChild<adw::EntryRow>,
+        #[template_child]
+        pub noise_switch: TemplateChild<adw::SwitchRow>,
         pub session: Arc<Mutex<Option<Session<Screencast>>>>,
         #[template_child]
         pub monitor_check: TemplateChild<gtk::CheckButton>,
@@ -44,6 +61,8 @@ mod imp {
         #[template_child]
         pub persist_mode_combo: TemplateChild<adw::ComboRow>,
         pub session_token: Arc<Mutex<Option<String>>>,
+        pub recorder: RefCell<Option<ScreenCastRecorder>>,
+        pub noise: RefCell<Option<NoiseGenerator>>,
     }
 
     #[glib::object_subclass]
@@ -72,6 +91,44 @@ mod imp {
         fn constructed(&self) {
             self.parent_constructed();
             self.obj().action_set_enabled("screencast.stop", false);
+
+            // The recording path is only editable when recording is enabled.
+            self.record_switch
+                .bind_property("active", &*self.record_path_entry, "sensitive")
+                .sync_create()
+                .build();
+
+            // Include-own-audio is only meaningful when audio is requested.
+            self.audio_switch
+                .bind_property("active", &*self.include_self_switch, "sensitive")
+                .sync_create()
+                .build();
+
+            // Start/stop the white-noise test source the moment the switch is
+            // toggled, independent of the screen cast session.
+            let page = self.obj();
+            self.noise_switch.connect_active_notify(clone!(
+                #[weak]
+                page,
+                move |switch| {
+                    let imp = page.imp();
+                    if switch.is_active() {
+                        match NoiseGenerator::new() {
+                            Ok(noise) => {
+                                imp.noise.replace(Some(noise));
+                                page.info("Producing pink-noise test audio");
+                            }
+                            Err(err) => {
+                                tracing::error!("Failed to start noise generator: {err}");
+                                page.error(&format!("Failed to produce test audio: {err}"));
+                                switch.set_active(false);
+                            }
+                        }
+                    } else if let Some(noise) = imp.noise.take() {
+                        noise.stop();
+                    }
+                }
+            ));
         }
     }
     impl WidgetImpl for ScreenCastPage {
@@ -131,6 +188,45 @@ glib::wrapper! {
         @implements gtk::ConstraintTarget, gtk::Buildable, gtk::Accessible;
 }
 
+/// The stream metadata needed to associate an audio stream with its source.
+trait StreamMapping {
+    fn is_audio(&self) -> bool;
+    fn mapping_id(&self) -> Option<&str>;
+}
+
+impl StreamMapping for Stream {
+    fn is_audio(&self) -> bool {
+        self.media_type() == MediaType::Audio
+    }
+
+    fn mapping_id(&self) -> Option<&str> {
+        Stream::mapping_id(self)
+    }
+}
+
+/// Returns the index of the single audio stream that shares `video`'s
+/// non-empty mapping id, or `None` when the mapping is missing, empty,
+/// matches no audio, or is ambiguous.
+fn unique_mapped_audio<T: StreamMapping>(streams: &[T], video: &T) -> Option<usize> {
+    let mapping_id = video.mapping_id().filter(|id| !id.is_empty())?;
+
+    let video_count = streams
+        .iter()
+        .filter(|s| !s.is_audio() && s.mapping_id() == Some(mapping_id))
+        .count();
+    if video_count != 1 {
+        return None;
+    }
+
+    let mut matches = streams
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.is_audio() && s.mapping_id() == Some(mapping_id))
+        .map(|(index, _)| index);
+    let index = matches.next()?;
+    matches.next().is_none().then_some(index)
+}
+
 impl ScreenCastPage {
     /// Returns the selected SourceType
     fn selected_sources(&self) -> BitFlags<SourceType> {
@@ -183,16 +279,86 @@ impl ScreenCastPage {
         match self.screencast().await {
             Ok((streams, fd, session)) => {
                 self.success("Screen cast session started successfully");
+
+                // Record whenever the Record switch is on, regardless of Audio. An empty
+                // path field falls back to the default webm location.
+                let record_path = imp.record_switch.is_active().then(|| {
+                    let text = imp.record_path_entry.text().to_string();
+                    if text.is_empty() {
+                        "/tmp/ashpd.webm".to_string()
+                    } else {
+                        text
+                    }
+                });
+
+                // The webm records the first video stream plus the audio stream (if any).
+                let video_index = streams
+                    .iter()
+                    .position(|s| s.media_type() != MediaType::Audio);
+                let video_node = video_index.map(|index| streams[index].pipe_wire_node_id());
+                let audio_node = video_index.and_then(|index| {
+                    unique_mapped_audio(&streams, &streams[index])
+                        .map(|audio_index| streams[audio_index].pipe_wire_node_id())
+                });
+
                 streams.iter().for_each(|stream: &Stream| {
                     let paintable = CameraPaintable::default();
                     let picture = gtk::Picture::builder()
                         .paintable(&paintable)
-                        .hexpand(true)
+                        .width_request(480)
                         .vexpand(true)
                         .build();
-                    paintable.set_pipewire_node_id(fd.as_fd(), Some(stream.pipe_wire_node_id()));
-                    imp.streams_carousel.append(&picture);
+                    if stream.media_type() == MediaType::Audio {
+                        self.info(&format!(
+                            "Audio stream available at PipeWire node {}",
+                            stream.pipe_wire_node_id()
+                        ));
+                        paintable.set_audio_pipewire_node_id(
+                            fd.as_fd(),
+                            Some(stream.pipe_wire_node_id()),
+                        );
+                    } else {
+                        paintable
+                            .set_pipewire_node_id(fd.as_fd(), Some(stream.pipe_wire_node_id()));
+                    }
+                    imp.streams_box.append(&picture);
                 });
+
+                if let Some(ref path) = record_path {
+                    let video_count = streams
+                        .iter()
+                        .filter(|s| s.media_type() != MediaType::Audio)
+                        .count();
+                    if video_count > 1 {
+                        tracing::info!(
+                            "Recording first video stream only; {} other video stream(s) not recorded",
+                            video_count - 1
+                        );
+                    }
+                    match video_node {
+                        Some(video_node) => {
+                            match ScreenCastRecorder::new(
+                                fd.as_fd(),
+                                video_node,
+                                audio_node,
+                                path,
+                            ) {
+                                Ok(recorder) => {
+                                    self.info(&format!("Recording to {path}"));
+                                    imp.recorder.replace(Some(recorder));
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "Recording unavailable ({err}); continuing without recording"
+                                    );
+                                }
+                            }
+                        }
+                        None => {
+                            tracing::warn!("No video stream to record; continuing without recording");
+                        }
+                    }
+                }
 
                 imp.response_group.set_visible(true);
 
@@ -213,6 +379,9 @@ impl ScreenCastPage {
 
     async fn stop_session(&self) {
         let imp = self.imp();
+        if let Some(recorder) = imp.recorder.take() {
+            recorder.stop();
+        }
 
         self.action_set_enabled("screencast.start", true);
         self.action_set_enabled("screencast.stop", false);
@@ -223,22 +392,14 @@ impl ScreenCastPage {
             })
             .await;
         }
-        if let Some(mut child) = imp.streams_carousel.first_child() {
-            loop {
-                let picture = child.downcast_ref::<gtk::Picture>().unwrap();
-                let paintable = picture
-                    .paintable()
-                    .and_downcast::<CameraPaintable>()
-                    .unwrap();
-                paintable.close_pipeline();
-                imp.streams_carousel.remove(picture);
-
-                if let Some(next_child) = child.next_sibling() {
-                    child = next_child;
-                } else {
-                    break;
-                }
-            }
+        while let Some(child) = imp.streams_box.first_child() {
+            let picture = child.downcast_ref::<gtk::Picture>().unwrap();
+            let paintable = picture
+                .paintable()
+                .and_downcast::<CameraPaintable>()
+                .unwrap();
+            paintable.close_pipeline();
+            imp.streams_box.remove(picture);
         }
 
         imp.response_group.set_visible(false);
@@ -250,6 +411,9 @@ impl ScreenCastPage {
         let cursor_mode = self.selected_cursor_mode();
         let persist_mode = self.selected_persist_mode();
         let multiple = imp.multiple_switch.is_active();
+        let audio = imp.audio_switch.is_active().then(|| {
+            AudioOptions::default().set_include_self(imp.include_self_switch.is_active())
+        });
 
         let root = self.native().unwrap();
 
@@ -272,6 +436,7 @@ impl ScreenCastPage {
                         .set_cursor_mode(cursor_mode)
                         .set_sources(sources)
                         .set_multiple(multiple)
+                        .set_audio(audio)
                         .set_restore_token(prev_token.as_deref())
                         .set_persist_mode(persist_mode),
                 )
@@ -309,4 +474,68 @@ pub async fn available_types() -> ashpd::Result<(BitFlags<CursorMode>, BitFlags<
         ashpd::Result::Ok((cursor_modes, source_types))
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct FakeStream {
+        audio: bool,
+        mapping_id: Option<&'static str>,
+    }
+
+    impl StreamMapping for FakeStream {
+        fn is_audio(&self) -> bool {
+            self.audio
+        }
+
+        fn mapping_id(&self) -> Option<&str> {
+            self.mapping_id
+        }
+    }
+
+    fn stream(audio: bool, mapping_id: Option<&'static str>) -> FakeStream {
+        FakeStream { audio, mapping_id }
+    }
+
+    #[test]
+    fn unique_mapped_audio_association() {
+        // Complete group in arbitrary order.
+        let streams = vec![
+            stream(true, Some("m0")),
+            stream(false, Some("m1")),
+            stream(false, Some("m0")),
+        ];
+        assert_eq!(unique_mapped_audio(&streams, &streams[2]), Some(0));
+
+        // Video-only group.
+        let streams = vec![stream(false, Some("m0"))];
+        assert_eq!(unique_mapped_audio(&streams, &streams[0]), None);
+
+        // Unmatched audio.
+        let streams = vec![stream(false, Some("m0")), stream(true, Some("m1"))];
+        assert_eq!(unique_mapped_audio(&streams, &streams[0]), None);
+
+        // Audio mapping matches multiple videos.
+        let streams = vec![
+            stream(false, Some("m0")),
+            stream(false, Some("m0")),
+            stream(true, Some("m0")),
+        ];
+        assert_eq!(unique_mapped_audio(&streams, &streams[0]), None);
+
+        // Multiple audio streams for one mapping.
+        let streams = vec![
+            stream(false, Some("m0")),
+            stream(true, Some("m0")),
+            stream(true, Some("m0")),
+        ];
+        assert_eq!(unique_mapped_audio(&streams, &streams[0]), None);
+
+        // Empty mapping id is never associated.
+        let streams = vec![stream(false, Some("")), stream(true, Some(""))];
+        assert_eq!(unique_mapped_audio(&streams, &streams[0]), None);
+    }
 }

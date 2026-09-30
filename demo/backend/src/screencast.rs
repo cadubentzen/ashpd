@@ -1,24 +1,28 @@
+use std::{collections::HashSet, sync::Mutex};
+
 use ashpd::{
     MaybeAppID, WindowIdentifierType,
     backend::{
         Result,
         request::RequestImpl,
-        screencast::{ScreencastImpl, SelectSourcesResponse},
+        screencast::{
+            AudioStreamBuilder, ScreencastImpl, SelectSourcesOptions, SelectSourcesResponse,
+            Streams, StreamsBuilder,
+        },
         session::{CreateSessionResponse, SessionImpl},
     },
     desktop::{
         CreateSessionOptions, HandleToken,
-        screencast::{
-            CursorMode, SelectSourcesOptions, SourceType, StartCastOptions, StreamBuilder, Streams,
-            StreamsBuilder,
-        },
+        screencast::{CursorMode, SourceType, StartCastOptions, StreamBuilder},
     },
     enumflags2::BitFlags,
 };
 use async_trait::async_trait;
 
 #[derive(Default)]
-pub struct Screencast {}
+pub struct Screencast {
+    audio_sessions: Mutex<HashSet<HandleToken>>,
+}
 
 #[async_trait]
 impl RequestImpl for Screencast {
@@ -53,9 +57,12 @@ impl ScreencastImpl for Screencast {
         _token: HandleToken,
         session_token: HandleToken,
         _app_id: Option<MaybeAppID>,
-        _options: SelectSourcesOptions,
+        options: SelectSourcesOptions,
     ) -> Result<SelectSourcesResponse> {
         tracing::debug!("IN Screencast::select_sources(): {session_token}");
+        if options.is_audio().unwrap_or(false) {
+            self.audio_sessions.lock().unwrap().insert(session_token);
+        }
         Ok(SelectSourcesResponse::default())
     }
 
@@ -68,12 +75,16 @@ impl ScreencastImpl for Screencast {
         _options: StartCastOptions,
     ) -> Result<Streams> {
         tracing::debug!("IN Screencast::start_cast(): {session_token}");
-        let streams = vec![
+        let mut builder = StreamsBuilder::new(vec![
             StreamBuilder::new(42)
                 .source_type(SourceType::Monitor)
+                .mapping_id("monitor-0".to_string())
                 .build(),
-        ];
-        Ok(StreamsBuilder::new(streams).build())
+        ]);
+        if self.audio_sessions.lock().unwrap().remove(&session_token) {
+            builder = builder.audio_streams(vec![AudioStreamBuilder::new("monitor-0").build()]);
+        }
+        Ok(builder.build())
     }
 }
 

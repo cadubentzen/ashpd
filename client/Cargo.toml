@@ -97,9 +97,10 @@ zbus = { version = "5.16", default-features = false }
 serde_json = "1.0"
 reis = { version = "0.7", features = ["tokio"] }
 pipewire = "0.10.0"
-tokio = { version = "1.51", features = [ "rt-multi-thread", "macros" ] }
+tokio = { version = "1.51", features = [ "rt-multi-thread", "macros", "signal" ] }
 gst = { package = "gstreamer", version = "0.25" }
 quick-xml = "0.41"
+clap = { workspace = true }
 
 [package.metadata.docs.rs]
 features = ["backend", "gtk4", "raw_handle",
@@ -118,6 +119,10 @@ required-features = ["screencast"]
 [[example]]
 name = "screen_cast_pw"
 required-features = ["screencast", "pipewire"]
+
+[[example]]
+name = "screen_cast_audio"
+required-features = ["screencast", "tokio"]
 
 [[example]]
 name = "input_capture"

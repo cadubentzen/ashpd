@@ -22,6 +22,36 @@
                       </object>
                     </child>
                     <child>
+                      <object class="AdwSwitchRow" id="audio_switch">
+                        <property name="title" translatable="yes">Audio</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="AdwSwitchRow" id="include_self_switch">
+                        <property name="title" translatable="yes">Include own audio</property>
+                        <property name="subtitle" translatable="yes">Allow the requesting application's audio in the capture</property>
+                        <property name="sensitive">False</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="AdwSwitchRow" id="record_switch">
+                        <property name="title" translatable="yes">Record</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="AdwEntryRow" id="record_path_entry">
+                        <property name="title" translatable="yes">Recording file path</property>
+                        <property name="text">/tmp/ashpd.webm</property>
+                        <property name="sensitive">False</property>
+                      </object>
+                    </child>
+                    <child>
+                      <object class="AdwSwitchRow" id="noise_switch">
+                        <property name="title" translatable="yes">Produce test audio (pink noise)</property>
+                        <property name="subtitle" translatable="yes">Plays low-volume pink noise so you can verify the requester's own audio is excluded when capturing a monitor</property>
+                      </object>
+                    </child>
+                    <child>
                       <object class="AdwComboRow" id="cursor_mode_combo">
                         <property name="title" translatable="yes">Cursor Mode</property>
                         <property name="selected">1</property>
@@ -133,15 +163,12 @@
             <property name="visible">False</property>
             <property name="vexpand">True</property>
             <child>
-              <object class="AdwCarouselIndicatorLines">
-                <property name="carousel">streams_carousel</property>
-                <property name="margin-top">12</property>
-                <property name="margin-bottom">24</property>
-              </object>
-            </child>
-            <child>
-              <object class="AdwCarousel" id="streams_carousel">
+              <object class="GtkBox" id="streams_box">
+                <property name="orientation">horizontal</property>
+                <property name="halign">center</property>
+                <property name="spacing">12</property>
                 <property name="vexpand">True</property>
+                <property name="margin-top">12</property>
               </object>
             </child>
           </object>

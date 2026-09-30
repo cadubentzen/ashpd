@@ -167,12 +167,100 @@ impl CameraPaintable {
         Ok(())
     }
 
+    pub fn set_audio_pipewire_node_id(&self, fd: BorrowedFd<'_>, node_id: Option<u32>) {
+        let pipewire_element = gst::ElementFactory::make("pipewiresrc").build().unwrap();
+        let raw_fd = fd.as_raw_fd();
+        pipewire_element.set_property("fd", raw_fd);
+        if let Some(node) = node_id {
+            tracing::debug!(
+                "Loading audio PipeWire Node ID: {} with FD: {}",
+                node.to_string(),
+                raw_fd
+            );
+            pipewire_element.set_property("path", node.to_string());
+        } else {
+            tracing::debug!("Loading audio PipeWire FD: {}", raw_fd);
+        }
+        if let Err(err) = self.init_audio_pipeline(pipewire_element) {
+            tracing::error!("Failed to initialize audio pipeline: {err}");
+        }
+    }
+
+    fn init_audio_pipeline(&self, pipewire_src: gst::Element) -> anyhow::Result<()> {
+        tracing::debug!("Init audio pipeline");
+        let imp = self.imp();
+        let pipeline = gst::Pipeline::new();
+
+        // Visualization sink, wired exactly like the video path so snapshot/sizing reuse.
+        let sink = gst::ElementFactory::make("gtk4paintablesink").build()?;
+        let paintable = sink.property::<gdk::Paintable>("paintable");
+
+        paintable.connect_invalidate_contents(clone!(
+            #[weak(rename_to = pt)]
+            self,
+            move |_| {
+                pt.invalidate_contents();
+            }
+        ));
+        paintable.connect_invalidate_size(clone!(
+            #[weak(rename_to = pt)]
+            self,
+            move |_| {
+                pt.invalidate_size();
+            }
+        ));
+        imp.sink_paintable.replace(Some(paintable));
+
+        let audioconvert = gst::ElementFactory::make("audioconvert").build()?;
+        let viz_queue = gst::ElementFactory::make("queue").build()?;
+        let spectrascope = gst::ElementFactory::make("spectrascope").build()?;
+        let videoconvert = gst::ElementFactory::make("videoconvert").build()?;
+
+        pipeline.add_many([
+            &pipewire_src,
+            &audioconvert,
+            &viz_queue,
+            &spectrascope,
+            &videoconvert,
+            &sink,
+        ])?;
+        gst::Element::link_many([
+            &pipewire_src,
+            &audioconvert,
+            &viz_queue,
+            &spectrascope,
+            &videoconvert,
+            &sink,
+        ])?;
+
+        let bus = pipeline.bus().unwrap();
+        let guard = bus
+            .add_watch_local(move |_, msg| {
+                if let gst::MessageView::Error(err) = msg.view() {
+                    tracing::error!(
+                        "Error from {:?}: {} ({:?})",
+                        err.src().map(|s| s.path_string()),
+                        err.error(),
+                        err.debug()
+                    );
+                }
+                glib::ControlFlow::Continue
+            })
+            .expect("Failed to add bus watch");
+        pipeline.set_state(gst::State::Playing)?;
+        imp.pipeline.replace(Some(pipeline));
+        imp.guard.replace(Some(guard));
+        Ok(())
+    }
+
     pub fn close_pipeline(&self) {
         tracing::debug!("Closing pipeline");
-        if let Some(pipeline) = self.imp().pipeline.take() {
+        let imp = self.imp();
+        // Drop the bus watch first.
+        let _ = imp.guard.take();
+        if let Some(pipeline) = imp.pipeline.take() {
             pipeline.set_state(gst::State::Null).unwrap();
         }
-        let _ = self.imp().guard.take();
     }
 }
 
